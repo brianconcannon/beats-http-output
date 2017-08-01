@@ -1,6 +1,8 @@
 beats-http-output
 =================
 
+[![Build Status](https://travis-ci.org/brianconcannon/beats-http-output.svg?branch=master)](https://travis-ci.org/brianconcannon/beats-http-output)
+
 This is an http(s) output for Elastic beats. There are other similar projects, such as https://github.com/raboof/beats-output-http. In this project I've added the ability to specify http headers in the config and will likely add other features down the road.
 
 Usage
