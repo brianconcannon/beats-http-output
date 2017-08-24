@@ -7,8 +7,10 @@ import (
 	"io/ioutil"
 	"net/http"
 	"net/url"
+	"sync"
 	"time"
 
+	"github.com/elastic/beats/libbeat/common"
 	"github.com/elastic/beats/libbeat/logp"
 	"github.com/elastic/beats/libbeat/outputs"
 	"github.com/elastic/beats/libbeat/outputs/outil"
@@ -31,23 +33,32 @@ type ClientSettings struct {
 	TLS                *transport.TLSConfig
 	Username, Password string
 	Parameters         map[string]string
-    Headers            map[string]string
+	Headers            map[string]string
 	Index              outil.Selector
 	Pipeline           *outil.Selector
 	Timeout            time.Duration
 	CompressionLevel   int
+	BufferMinInterval  time.Duration
+	BufferMaxInterval  time.Duration
+	BufferCount        int
 }
 
 type Connection struct {
 	URL      string
 	Username string
 	Password string
-    Headers  map[string]string
+	Headers  map[string]string
 
-	http      *http.Client
-	connected bool
-
-	encoder bodyEncoder
+	buffer            []common.MapStr
+	bufferMinInterval time.Duration
+	bufferMaxInterval time.Duration
+	bufferCount       int
+	bufferMinTimer    time.Time
+	bufferMaxTimer    *time.Timer
+	lock              sync.Mutex
+	http              *http.Client
+	connected         bool
+	encoder           bodyEncoder
 }
 
 // Metrics that can retrieved through the expvar web interface.
@@ -104,12 +115,20 @@ func NewClient(
 		}
 	}
 
+	bufferMinTimer := time.Now()
+	bufferMaxTimer := time.NewTimer(s.BufferMaxInterval)
+
 	client := &Client{
 		Connection: Connection{
-			URL:      s.URL,
-			Username: s.Username,
-			Password: s.Password,
-            Headers:  s.Headers,
+			URL:               s.URL,
+			Username:          s.Username,
+			Password:          s.Password,
+			Headers:           s.Headers,
+			bufferMinInterval: s.BufferMinInterval,
+			bufferMaxInterval: s.BufferMaxInterval,
+			bufferCount:       s.BufferCount,
+			bufferMinTimer:    bufferMinTimer,
+			bufferMaxTimer:    bufferMaxTimer,
 			http: &http.Client{
 				Transport: &http.Transport{
 					Dial:    dialer.Dial,
@@ -120,11 +139,18 @@ func NewClient(
 			},
 			encoder: encoder,
 		},
-		params: params,
-
+		params:           params,
 		compressionLevel: compression,
 		proxyURL:         s.Proxy,
 	}
+
+	// Callback to Flush the buffer if bufferMaxInterval is reached
+	go func() {
+		for {
+			<-client.bufferMaxTimer.C
+			client.FlushBuffer()
+		}
+	}()
 
 	return client, nil
 }
@@ -136,15 +162,18 @@ func (client *Client) Clone() *Client {
 	// create install a template, we don't want these to be included in the clone.
 	c, _ := NewClient(
 		ClientSettings{
-			URL:              client.URL,
-			Proxy:            client.proxyURL,
-			TLS:              client.tlsConfig,
-			Username:         client.Username,
-			Password:         client.Password,
-			Parameters:       nil, // XXX: do not pass params?
-            Headers:          client.Headers,
-			Timeout:          client.http.Timeout,
-			CompressionLevel: client.compressionLevel,
+			URL:               client.URL,
+			Proxy:             client.proxyURL,
+			TLS:               client.tlsConfig,
+			Username:          client.Username,
+			Password:          client.Password,
+			Parameters:        nil, // XXX: do not pass params?
+			Headers:           client.Headers,
+			Timeout:           client.http.Timeout,
+			CompressionLevel:  client.compressionLevel,
+			BufferMinInterval: client.bufferMinInterval,
+			BufferMaxInterval: client.bufferMaxInterval,
+			BufferCount:       client.bufferCount,
 		},
 	)
 	return c
@@ -182,57 +211,99 @@ func (client *Client) PublishEvents(
 
 	var failedEvents []outputs.Data
 
-	sendErr := error(nil)
+	logp.Info("HTTP: Received %d events", len(data))
 	for _, event := range data {
-		sendErr = client.PublishEvent(event)
-		// TODO more gracefully handle failures return the failed events
-		// below instead of bailing out directly here:
-		if sendErr != nil {
-			return nil, sendErr
-		}
+		client.buffer = append(client.buffer, event.Event)
 	}
 
-	debugf("PublishEvents: %d metrics have been published over HTTP in %v.",
-		len(data),
-		time.Now().Sub(begin))
+	if len(client.buffer) > client.bufferCount {
+		err := client.FlushBuffer()
+		if err != nil {
+			logp.Warn("Failed to publish events, returning failed events: %s", err)
+			copy(failedEvents, data)
+		}
 
-	ackedEvents.Add(int64(len(data) - len(failedEvents)))
-	eventsNotAcked.Add(int64(len(failedEvents)))
-	if len(failedEvents) > 0 {
-		return failedEvents, sendErr
+		debugf("PublishEvents: %d metrics have been published over HTTP in %v.",
+			len(data),
+			time.Now().Sub(begin))
+
+		ackedEvents.Add(int64(len(data) - len(failedEvents)))
+		eventsNotAcked.Add(int64(len(failedEvents)))
+		if len(failedEvents) > 0 {
+			return failedEvents, err
+		}
 	}
 
 	return nil, nil
 }
 
 func (client *Client) PublishEvent(data outputs.Data) error {
+	err := error(nil)
 	if !client.connected {
-		return ErrNotConnected
-	}
-
-	event := data.Event
-
-	debugf("Publish event: %s", event)
-
-	status, _, err := client.request("POST", "", client.params, event)
-	if err != nil {
-		logp.Warn("Fail to insert a single event: %s", err)
-		if err == ErrJSONEncodeFailed {
-			// don't retry unencodable values
-			return nil
+		err = ErrNotConnected
+	} else {
+		client.buffer = append(client.buffer, data.Event)
+		logp.Info("HTTP: Received single event for publishing")
+		if len(client.buffer) > client.bufferCount {
+			err = client.FlushBuffer()
 		}
 	}
-	switch {
-	case status == 0: // event was not send yet
-		return nil
-	case status >= 500 || status == 429: // server error, retry
-		return err
-	case status >= 300 && status < 500:
-		// other error => don't retry
+	return err
+}
+
+func (client *Client) FlushBuffer() error {
+	client.lock.Lock()
+	defer client.lock.Unlock()
+
+	err := error(nil)
+
+	elapsedTime := time.Now().Sub(client.bufferMinTimer)
+	if elapsedTime < client.bufferMinInterval {
+		logp.Info("Min time not reached")
 		return nil
 	}
 
-	return nil
+	if len(client.buffer) > 0 {
+		status, _, err := client.request("POST", "", client.params, client.buffer)
+		if err != nil {
+			logp.Warn("Failed to POST events: %s. Status: %d", err, status)
+			if err == ErrJSONEncodeFailed {
+				// don't retry unencodable values
+				err = error(nil)
+			}
+		}
+		if status == 200 {
+			logp.Info("Successfully POSTED %d events to %s after %s seconds", len(client.buffer), client.URL, elapsedTime)
+		} else {
+			logp.Warn("Non-200 Status: %d", status)
+			switch {
+			case status == 0:
+				// event was not sent yet, don't retry
+				err = error(nil)
+			case status >= 300 && status < 500:
+				// other error => don't retry
+				err = error(nil)
+			}
+		}
+		client.buffer = nil
+	} else {
+		logp.Info("Nothing to flush")
+	}
+
+	client.ResetTimer()
+
+	return err
+}
+
+func (client *Client) ResetTimer() {
+	client.bufferMinTimer = time.Now()
+	stop := client.bufferMaxTimer.Stop()
+	if stop == true {
+		logp.Info("Resetting unexpired timer")
+	} else {
+		logp.Info("Resetting expired timer")
+	}
+	client.bufferMaxTimer.Reset(client.bufferMaxInterval)
 }
 
 func (conn *Connection) request(
@@ -275,7 +346,7 @@ func (conn *Connection) execHTTPRequest(req *http.Request) (int, []byte, error) 
 		req.SetBasicAuth(conn.Username, conn.Password)
 	}
 
-    for name, value := range conn.Headers {
+	for name, value := range conn.Headers {
 		req.Header.Add(name, value)
 	}
 

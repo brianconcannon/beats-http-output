@@ -14,6 +14,9 @@
 #    headers:
 #      Content-Type: application/json
 #      X-API-Key: abcdefghijklmnop...
+#    bufferMinInterval: 10   # Min number of seconds before buffered events are POSTed
+#    bufferMaxInterval: 30   # Max number of seconds before buffered events are POSTed
+#    bufferCount: 2          # Number of events to buffer before POSTing
 #    tls:
 #        enabled: false
 #        verification_mode: "full"

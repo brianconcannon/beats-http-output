@@ -117,15 +117,18 @@ func makeClientFactory(
 		}
 
 		return NewClient(ClientSettings{
-			URL:              hostURL,
-			Proxy:            proxyURL,
-			TLS:              tls,
-			Username:         config.Username,
-			Password:         config.Password,
-			Parameters:       params,
-            Headers:          config.Headers,
-			Timeout:          config.Timeout,
-			CompressionLevel: config.CompressionLevel,
+			URL:               hostURL,
+			Proxy:             proxyURL,
+			TLS:               tls,
+			Username:          config.Username,
+			Password:          config.Password,
+			Parameters:        params,
+			Headers:           config.Headers,
+			Timeout:           config.Timeout,
+			CompressionLevel:  config.CompressionLevel,
+			BufferMinInterval: config.BufferMinInterval,
+			BufferMaxInterval: config.BufferMaxInterval,
+			BufferCount:       config.BufferCount,
 		})
 	}
 }

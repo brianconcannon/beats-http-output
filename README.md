@@ -1,9 +1,13 @@
 beats-http-output
 =================
 
-[![Build Status](https://travis-ci.org/brianconcannon/beats-http-output.svg?branch=master)](https://travis-ci.org/brianconcannon/beats-http-output)
+This is an http(s) output for Elastic beats. It allows for HTTP POSTs of collected events to an API. So far I have added the following features:
 
-This is an http(s) output for Elastic beats. There are other similar projects, such as https://github.com/raboof/beats-output-http. In this project I've added the ability to specify http headers in the config and will likely add other features down the road.
+* Ability to specify HTTP headers
+* Ability to microbatch events into a single POST. You can specify:
+    * Batch size
+    * Minimum time between POSTS
+    * Maximum time between POSTS
 
 Usage
 =====
